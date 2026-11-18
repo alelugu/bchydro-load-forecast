@@ -1,0 +1,34 @@
+name: daily
+
+on:
+  schedule:
+    - cron: "30 16 * * *"   # 09:30 Pacific (BC is UTC-7 all year since 2026)
+    - cron: "30 20 * * *"   # 13:30 Pacific retry
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: daily
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Download and load the current BC Hydro file
+        run: python -m bchydro.ingest.load
+
+      - name: Archive raw files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/raw
+          git diff --cached --quiet || git commit -m "data: raw files $(date -u +%F)"
+          git push
