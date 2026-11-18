@@ -21,11 +21,18 @@ def fetch(kind: str, lat: float, lon: float, start: str | None = None, end: str 
         params["forecast_days"] = 7
     else:
         params |= {"start_date": start, "end_date": end}
+    resp = None
     for attempt in range(4):
-        resp = requests.get(config.OPEN_METEO[kind], params=params, timeout=120)
-        if resp.status_code != 429:          # 429 = free-tier rate limit: wait and retry
+        try:
+            resp = requests.get(config.OPEN_METEO[kind], params=params, timeout=45)
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 3:                 # the server did not answer four times: give up
+                raise
+            time.sleep(10 * (attempt + 1))
+            continue
+        if resp.status_code not in (429, 502, 503, 504):
             break
-        time.sleep(65)
+        time.sleep(65 if resp.status_code == 429 else 15)   # 429 = free-tier rate limit
     resp.raise_for_status()
     time.sleep(2)                            # stay well under the per-minute limit
     h = resp.json()["hourly"]
