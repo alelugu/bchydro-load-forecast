@@ -26,12 +26,13 @@ def check_tz() -> None:
         raise RuntimeError("Time-zone database is out of date for BC (expected UTC-7 in "
                            "December 2026). Run: pip install -U tzdata")
 
-# BC Hydro load files. Copy the exact links from:
-#   https://www.bchydro.com/energy-in-bc/operations/transmission/transmission-system/balancing-authority-load-data.html
-#   (current hourly file) and its "historical transmission data" page (yearly files).
-BCH_CURRENT_HOURLY_URL = os.getenv("BCH_CURRENT_HOURLY_URL", "")  # TODO: paste the link
+# BC Hydro load files, from "Balancing Authority Load Data" on bchydro.com.
+_BCH = ("https://www.bchydro.com/content/dam/BCHydro/customer-portal/documents/corporate/"
+        "suppliers/transmission-system/balancing_authority_load_data/")
+BCH_CURRENT_HOURLY_URL = os.getenv("BCH_CURRENT_HOURLY_URL", _BCH + "CurrentHourlyBALoad.xls")
 BCH_HISTORICAL_URLS: dict[int, str] = {
-    # 2015: "https://www.bchydro.com/....xls",  TODO: paste one link per year, 2015-2026
+    2026: _BCH + "BalancingAuthorityLoad%202026.xls",
+    # TODO: add 2015-2025, copying each link from the historical page (names may differ by year)
 }
 
 # Weather locations: (id, name, lat, lon, population weight). Weights are rough
