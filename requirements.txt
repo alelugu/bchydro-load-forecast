@@ -1,0 +1,11 @@
+# Python 3.13
+gradio==6.32.0
+plotly==7.1.0
+pandas==3.0.5
+requests==2.34.2
+holidays==0.109
+xlrd==2.0.2
+tzdata>=2026.1
+pytest==9.1.1
+lightgbm==4.7.0
+scikit-learn==1.9.1
