@@ -7,9 +7,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write           # commit raw files, replace the database in the release
 
 concurrency: daily
+
+env:
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   run:
@@ -22,8 +25,29 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
 
-      - name: Download and load the current BC Hydro file
-        run: python -m bchydro.ingest.load
+      # The database lives in the "data" release, not in git. If it cannot be
+      # downloaded the job stops here, so an empty database is never published.
+      - name: Get the published database
+        run: gh release download data --pattern bchydro.sqlite --dir data --clobber
+
+      - name: Daily job
+        id: job
+        continue-on-error: true
+        run: python -m bchydro.jobs.daily
+
+      - name: Check the database before publishing
+        run: |
+          python -c "
+          from bchydro import db
+          con = db.connect()
+          load = con.execute('select count(*), max(ts_local) from load_hourly').fetchone()
+          wx = con.execute('select count(*) from weather_hourly').fetchone()[0]
+          print('load rows:', load[0], '| latest hour:', load[1], '| weather rows:', wx)
+          assert load[0] > 100000 and wx > 500000, 'database looks incomplete: not publishing'
+          "
+
+      - name: Publish the database
+        run: gh release upload data data/bchydro.sqlite --clobber
 
       - name: Archive raw files
         run: |
@@ -32,3 +56,7 @@ jobs:
           git add data/raw
           git diff --cached --quiet || git commit -m "data: raw files $(date -u +%F)"
           git push
+
+      - name: Fail if a step of the daily job failed
+        if: steps.job.outcome == 'failure'
+        run: exit 1
