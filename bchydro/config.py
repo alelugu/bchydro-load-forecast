@@ -30,9 +30,13 @@ def check_tz() -> None:
 _BCH = ("https://www.bchydro.com/content/dam/BCHydro/customer-portal/documents/corporate/"
         "suppliers/transmission-system/balancing_authority_load_data/")
 BCH_CURRENT_HOURLY_URL = os.getenv("BCH_CURRENT_HOURLY_URL", _BCH + "CurrentHourlyBALoad.xls")
+_HIST = _BCH + "Historical%20Transmission%20Data/"
+# BC Hydro's file names are not uniform: 2024 onward have a space before the year.
 BCH_HISTORICAL_URLS: dict[int, str] = {
-    2026: _BCH + "BalancingAuthorityLoad%202026.xls",
-    # TODO: add 2015-2025, copying each link from the historical page (names may differ by year)
+    **{y: f"{_HIST}BalancingAuthorityLoad{y}.xls" for y in range(2015, 2024)},
+    2024: _HIST + "BalancingAuthorityLoad%202024.xls",
+    2025: _HIST + "BalancingAuthorityLoad%202025.xls",
+    2026: _BCH + "BalancingAuthorityLoad%202026.xls",   # current year sits one folder up
 }
 
 # Weather locations: (id, name, lat, lon, population weight). Weights are rough

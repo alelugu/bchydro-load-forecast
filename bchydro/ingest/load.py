@@ -2,17 +2,21 @@
 
     python -m bchydro.ingest.load data/raw/BalancingAuthorityLoad_2026.xls   # load a file
     python -m bchydro.ingest.load                                            # download + load "current"
+    python -m bchydro.ingest.load --historical                               # download + load every year
 
-File layout (checked on the 2026 and "current" files, 17 Nov 2026):
-  - a few title rows, then a header row: "Date", "HE", "Control Area Load"
-  - Date is text MM/DD/YYYY in Pacific local time; HE is hour-ending 1..24; load is MW
+File layout (checked on the yearly files 2015-2026 except 2023 and 2025, and on "current"):
+  - a few title rows, then a header row: "Date", "HE", and the load column
+  - Date is Pacific local time, as text MM/DD/YYYY or as a date cell (2020 mixes both)
+  - HE is hour-ending 1..24; load is MW
   - the yearly file covers whole months; the "current" file holds the month to date
-  - 8 Mar 2026 (clocks forward) has 23 rows, with HE 2 left out
+  - clocks forward (March): 23 rows, or 24 rows where the skipped hour is a 0 MW or blank placeholder
+  - clocks back (November, up to 2025): 25 rows, the repeated hour labelled "2*" or 2
 So hours are placed by their order within the day, not by the HE label: the first row of a
-day is local midnight and each next row is one hour later. That is right on 23-, 24- and
-25-hour days as long as the day has the number of rows the calendar says it should.
+day is local midnight and each next row is one hour later. Each day must have the number of
+hours the calendar says it should, otherwise the file is rejected.
 """
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,12 +26,19 @@ import requests
 from .. import config, db
 
 
-def download(url: str, name: str) -> Path:
-    """Save a BC Hydro file under data/raw/ and return its path."""
+def download(url: str, name: str, tries: int = 3) -> Path:
+    """Save a BC Hydro file under data/raw/ and return its path. An empty or tiny
+    response is retried and never saved (the server sometimes answers with 0 bytes)."""
     if not url:
         raise ValueError("BC Hydro URL not set: see bchydro/config.py")
-    resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0 (course project)"})
-    resp.raise_for_status()
+    for attempt in range(tries):
+        resp = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0 (course project)"})
+        resp.raise_for_status()
+        if len(resp.content) > 10_000:
+            break
+        time.sleep(3 * (attempt + 1))
+    else:
+        raise ValueError(f"{name}: download came back empty after {tries} tries ({url})")
     config.RAW_DIR.mkdir(parents=True, exist_ok=True)
     path = config.RAW_DIR / name
     path.write_bytes(resp.content)
@@ -41,9 +52,27 @@ def download_current() -> Path:
     return download(config.BCH_CURRENT_HOURLY_URL, f"current_hourly_{stamp}.xls")
 
 
-def download_historical() -> list[Path]:
-    return [download(url, f"BalancingAuthorityLoad_{year}.xls")
-            for year, url in sorted(config.BCH_HISTORICAL_URLS.items())]
+def historical_files() -> list[tuple[int, Path | Exception]]:
+    """One (year, path) per yearly file. Finished years already in data/raw are not
+    downloaded again; the current year always is, because BC Hydro extends it."""
+    this_year = datetime.now(timezone.utc).year
+    out = []
+    for year, url in sorted(config.BCH_HISTORICAL_URLS.items()):
+        path = config.RAW_DIR / f"BalancingAuthorityLoad_{year}.xls"
+        if year < this_year and path.exists() and path.stat().st_size > 10_000:
+            out.append((year, path))
+            continue
+        try:
+            out.append((year, download(url, path.name)))
+        except Exception as e:  # noqa: BLE001 - reported by the caller
+            out.append((year, e))
+    return out
+
+
+def _to_date(value) -> pd.Timestamp:
+    if isinstance(value, str):
+        return pd.to_datetime(value.strip(), format="%m/%d/%Y")
+    return pd.Timestamp(value).normalize()
 
 
 def parse_load_xls(path: Path) -> pd.DataFrame:
@@ -51,22 +80,32 @@ def parse_load_xls(path: Path) -> pd.DataFrame:
     Raises ValueError if the layout or a day's row count is not what we expect."""
     config.check_tz()
     raw = pd.read_excel(path, header=None, dtype=object)
-    is_header = (raw[0].astype(str).str.strip() == "Date") & (raw[1].astype(str).str.strip() == "HE")
+    # The header reads "Date", "Date ?" or "Date ▲" depending on the year.
+    is_header = (raw[0].astype(str).str.strip().str.startswith("Date")
+                 & (raw[1].astype(str).str.strip() == "HE"))
     if not is_header.any():
-        raise ValueError(f"{path.name}: header row 'Date | HE | Control Area Load' not found")
+        raise ValueError(f"{path.name}: header row 'Date | HE | load' not found")
     df = raw.iloc[is_header.idxmax() + 1:, :3].dropna(how="all")
     df.columns = ["date", "he", "load_mw"]
 
-    df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), format="%m/%d/%Y")
+    df["date"] = df["date"].map(_to_date)
     df["load_mw"] = pd.to_numeric(df["load_mw"], errors="raise").astype(float)
-    if df["load_mw"].isna().any() or (df["load_mw"] <= 0).any():
-        raise ValueError(f"{path.name}: missing or non-positive load values")
     if not df["date"].is_monotonic_increasing:
         raise ValueError(f"{path.name}: dates are not in order")
 
     midnight = df["date"].dt.tz_localize(config.LOCAL_TZ).dt.tz_convert("UTC")
     next_midnight = (df["date"] + pd.Timedelta(days=1)).dt.tz_localize(config.LOCAL_TZ).dt.tz_convert("UTC")
     expected = ((next_midnight - midnight) / pd.Timedelta(hours=1)).astype(int)
+
+    # Some years keep the hour skipped in March as an extra row with 0 MW (2016, 2017,
+    # 2019, 2020) or a blank (2018): drop it.
+    rows_in_day = df.groupby("date")["he"].transform("size")
+    empty = (df["load_mw"] == 0) | df["load_mw"].isna()
+    placeholder = (expected == 23) & (rows_in_day == 24) & empty
+    df, midnight, expected = df[~placeholder], midnight[~placeholder], expected[~placeholder]
+
+    if df["load_mw"].isna().any() or (df["load_mw"] <= 0).any():
+        raise ValueError(f"{path.name}: missing or non-positive load values")
     position = df.groupby("date").cumcount()
     rows_in_day = df.groupby("date")["he"].transform("size")
 
@@ -92,7 +131,22 @@ def ingest_file(path: Path) -> int:
     return n
 
 
+def ingest_historical() -> None:
+    """Load every yearly file. A year that fails is reported and skipped, so one odd
+    file does not stop the others."""
+    for year, path in historical_files():
+        try:
+            if isinstance(path, Exception):
+                raise path
+            print(f"[ok]    {year}: {ingest_file(path)} rows")
+        except Exception as e:  # noqa: BLE001 - report and continue with the other years
+            print(f"[error] {year}: {e}")
+
+
 if __name__ == "__main__":
     db.init_db()
-    for f in [Path(a) for a in sys.argv[1:]] or [download_current()]:
-        print(f"{f.name}: {ingest_file(f)} rows")
+    if sys.argv[1:] == ["--historical"]:
+        ingest_historical()
+    else:
+        for f in [Path(a) for a in sys.argv[1:]] or [download_current()]:
+            print(f"{f.name}: {ingest_file(f)} rows")
