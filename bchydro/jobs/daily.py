@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 from .. import db
 from ..ingest import load, weather
+from ..modeling import forecast_job
 
 
 def _day(offset: int) -> str:
@@ -38,8 +39,9 @@ def main() -> int:
         # Observed weather is published about 5 days late; re-read a window to fill it in.
         step("weather_observed", lambda: weather.ingest("observed", _day(12), _day(6))),
         step("weather_forecast_archive", lambda: weather.ingest("forecast_archive", _day(4), _day(1))),
-        # Model owner adds here: score yesterday, correct, forecast tomorrow.
-        #   step("forecast", lambda: forecast_job.run(phase="live")),
+        # Score what is now known, correct (bias, retrain triggers, band), forecast tomorrow
+        # in every version, and write the 7-day outlook. Runs after the ingests above.
+        step("forecast", forecast_job.live),
     ]
     return 0 if all(ok) else 1
 

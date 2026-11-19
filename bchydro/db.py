@@ -18,7 +18,8 @@ def utcnow() -> str:
 def connect(path: Path | str | None = None, read_only: bool = False) -> sqlite3.Connection:
     path = Path(path or config.DB_PATH)
     if read_only:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        # as_uri() gives file:///C:/... on Windows; a raw "file:C:\\..." path can fail to open.
+        con = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(path)
@@ -30,7 +31,11 @@ def connect(path: Path | str | None = None, read_only: bool = False) -> sqlite3.
 def init_db(path: Path | str | None = None) -> None:
     """Create tables and seed the locations. Safe to run again."""
     with connect(path) as con:
-        con.executescript(SCHEMA.read_text())
+        con.executescript(SCHEMA.read_text(encoding="utf-8"))
+        # Columns added after the first release: add them to an existing database.
+        cols = {r[1] for r in con.execute("PRAGMA table_info(forecasts)")}
+        if "bias_mw" not in cols:
+            con.execute("ALTER TABLE forecasts ADD COLUMN bias_mw REAL")
         upsert(con, "locations",
                [dict(location_id=i, name=n, lat=la, lon=lo, pop_weight=w)
                 for i, n, la, lo, w in config.LOCATIONS])

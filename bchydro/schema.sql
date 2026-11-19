@@ -62,7 +62,16 @@ CREATE TABLE IF NOT EXISTS forecasts (
     yhat_lo_mw    REAL,
     yhat_hi_mw    REAL,
     horizon_h     INTEGER,
+    bias_mw       REAL,                    -- bias correction added to the raw model output
     PRIMARY KEY (run_id, target_ts_utc)
+) WITHOUT ROWID;
+
+-- Trained models (LightGBM as text) and validation results, shared by the daily job and the app.
+CREATE TABLE IF NOT EXISTS model_store (
+    name       TEXT PRIMARY KEY,           -- frozen / champion / outlook / validation
+    saved_at   TEXT NOT NULL,
+    train_end  TEXT,
+    model_json TEXT NOT NULL
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_forecasts_target ON forecasts(target_ts_utc);
