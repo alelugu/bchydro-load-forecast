@@ -18,7 +18,7 @@ def fetch(kind: str, lat: float, lon: float, start: str | None = None, end: str 
     params = {"latitude": lat, "longitude": lon, "hourly": ",".join(config.WEATHER_VARS),
               "timezone": "GMT", "wind_speed_unit": "kmh"}
     if kind == "forecast_live":
-        params["forecast_days"] = 7
+        params["forecast_days"] = 9      # 9 UTC days = 7 whole Pacific days after today
     else:
         params |= {"start_date": start, "end_date": end}
     resp = None

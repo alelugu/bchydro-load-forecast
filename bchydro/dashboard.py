@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from plotly.subplots import make_subplots
 from . import config, db
 from .modeling import features as F
 from .modeling import models as M
+from .modeling.forecast_job import one_run_per_day
 
 TZ = config.LOCAL_TZ
 VERSION_LABEL = {"retrained": "Retrained + corrected", "bias_corrected": "Frozen + bias correction",
@@ -59,6 +61,7 @@ def _cached(mtime: float) -> dict:
         FROM forecasts f JOIN model_runs r ON r.run_id = f.run_id
         LEFT JOIN load_hourly l ON l.ts_utc = f.target_ts_utc
         WHERE r.model_name != 'outlook'""", con)
+    scores = one_run_per_day(scores)      # the job runs twice a day: keep one forecast per day
     t = pd.to_datetime(scores["target_ts_utc"], utc=True).dt.tz_convert(TZ)
     scores["t"], scores["day"], scores["hour"] = t, pd.to_datetime(t.dt.date), t.dt.hour
     scores["err"] = scores["actual_mw"] - scores["yhat_mw"]
@@ -86,8 +89,26 @@ def thresholds(watch_pct: float, high_pct: float) -> tuple[float, float]:
     return float(np.percentile(p, watch_pct)), float(np.percentile(p, high_pct))
 
 
+def record_peak() -> tuple[float, pd.Timestamp]:
+    """The highest hour in the load data and when it happened."""
+    load = data()["load"]
+    return float(load.max()), load.idxmax().tz_convert(TZ)
+
+
+def parse_day(text: str) -> pd.Timestamp | None:
+    """A date typed by the user, or None if it is not a date."""
+    try:
+        t = pd.Timestamp(str(text).strip())
+    except (ValueError, TypeError):
+        return None
+    return None if pd.isna(t) else t.normalize().tz_localize(None)
+
+
+BAD_DATE = "Dates must look like 2026-11-24 (YYYY-MM-DD)."
+
+
 def level(peak: float, thr: tuple[float, float]) -> str:
-    if peak >= thr[1] or peak >= 0.97 * config.RECORD_PEAK_MW:
+    if peak >= thr[1] or peak >= 0.97 * record_peak()[0]:
         return "High"
     return "Watch" if peak >= thr[0] else "Normal"
 
@@ -168,8 +189,7 @@ def tomorrow(day_label: str, version_label: str, shift: float, watch_pct: float,
                                  line=dict(color=COLOR["whatif"], dash="dash", width=2)))
     if run["actual_mw"].notna().any():
         fig.add_trace(go.Scatter(x=x, y=run["actual_mw"], name="Actual", line=dict(color=COLOR["actual"], width=2)))
-    for name, y, c in [("Watch", thr[0], ALERT_COLOR["Watch"]), ("High", thr[1], ALERT_COLOR["High"]),
-                       ("Record 11,300", config.RECORD_PEAK_MW, "#6b7280")]:
+    for name, y, c in [("Watch", thr[0], ALERT_COLOR["Watch"]), ("High", thr[1], ALERT_COLOR["High"])]:
         fig.add_hline(y=y, line=dict(color=c, dash="dot", width=1.2), annotation_text=f"{name}",
                       annotation_position="top left")
     fig.update_layout(**LAYOUT, title=f"Hourly forecast for {day:%A %d %B %Y}", yaxis_title="Load (MW)")
@@ -187,10 +207,17 @@ def tomorrow(day_label: str, version_label: str, shift: float, watch_pct: float,
         kpi += f"\n\nWhat if {shift:+.0f} °C: peak {(run['yhat_mw'] + delta).max():,.0f} MW ({delta[run.index.get_loc(peak_i)]:+,.0f} MW at {peak_t:%H:00})."
     if run["actual_mw"].notna().any():
         kpi += f"\n\nActual peak {run['actual_mw'].max():,.0f} MW; hourly error {run['ape'].mean():.1f}% MAPE."
-    cold = ""
+    rec, rec_t = record_peak()
+    lows = sorted(low)
+    margin = thr[0] - peak
+    room = (f"The peak is {margin:,.0f} MW below the Watch level." if margin > 0
+            else f"The peak is {-margin:,.0f} MW above the Watch level.")
     action = (f"### Suggested actions: {ALERT_MARK[lvl]} {lvl}\n{ACTIONS[lvl]}\n\n"
+              f"{room} Lowest demand: {lows[0]:%H:00} to {lows[-1] + pd.Timedelta(hours=1):%H:00}, "
+              f"about {run.nsmallest(6, 'yhat_mw')['yhat_mw'].mean():,.0f} MW.\n\n"
               f"Thresholds: Watch from {thr[0]:,.0f} MW, High from {thr[1]:,.0f} MW "
-              f"(percentiles of winter daily peaks, 2015 to the cutoff).{cold}")
+              f"(percentiles of winter daily peaks, 2015 to the cutoff). "
+              f"Highest hour on record: {rec:,.0f} MW on {rec_t:%d %b %Y}.")
     return kpi, fig, action
 
 
@@ -214,22 +241,21 @@ def peak_risk(watch_pct: float, high_pct: float, temp_source: str):
     tmin = tt.min().reindex(g.index)
     g["level"] = [level(p, thr) for p in g["yhat_mw"]]
     labels = [f"{pd.Timestamp(d):%a %d %b}" for d in g.index]
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.08)
     fig.add_trace(go.Scatter(x=labels, y=g["yhat_mw"], mode="markers", name="Forecast daily peak (whiskers: 10-90% range)",
                              marker=dict(size=16, color=[ALERT_COLOR[l] for l in g["level"]], line=dict(color="white", width=1.5)),
                              error_y=dict(type="data", symmetric=False, color="#374151", thickness=1.5, width=8,
                                           array=(g["yhat_hi_mw"] - g["yhat_mw"]).clip(lower=0),
-                                          arrayminus=(g["yhat_mw"] - g["yhat_lo_mw"]).clip(lower=0))), secondary_y=False)
-    fig.add_trace(go.Scatter(x=labels, y=hdd, name=f"Heating degree days ({temp_source})", mode="lines+markers",
-                             line=dict(color="#2563eb")), secondary_y=True)
+                                          arrayminus=(g["yhat_mw"] - g["yhat_lo_mw"]).clip(lower=0))), row=1, col=1)
+    fig.add_trace(go.Bar(x=labels, y=hdd, name=f"Heating degree days ({temp_source})",
+                         marker_color="#93c5fd"), row=2, col=1)
     for name, y, c in [("Watch", thr[0], ALERT_COLOR["Watch"]), ("High", thr[1], ALERT_COLOR["High"])]:
-        fig.add_hline(y=y, line=dict(color=c, dash="dot"), annotation_text=name, secondary_y=False)
+        fig.add_hline(y=y, line=dict(color=c, dash="dot"), annotation_text=name, row=1, col=1)
     lo = min(g["yhat_lo_mw"].min(), thr[0]) * 0.97
-    fig.update_layout(**{**LAYOUT, "hovermode": "x"},
-                      title=f"Peak outlook, next {len(g)} days (as far as the weather forecast reaches; "
-                            f"issued {pd.Timestamp(r[1]).tz_convert(TZ):%a %d %b %H:%M})")
-    fig.update_yaxes(title_text="Daily peak (MW)", range=[lo, max(g["yhat_hi_mw"].max(), thr[1]) * 1.03], secondary_y=False)
-    fig.update_yaxes(title_text="HDD (°C-days)", secondary_y=True, showgrid=False)
+    fig.update_layout(**{**LAYOUT, "hovermode": "x", "height": 520},
+                      title=f"Peak outlook, next {len(g)} days (issued {pd.Timestamp(r[1]).tz_convert(TZ):%a %d %b %H:%M})")
+    fig.update_yaxes(title_text="Daily peak (MW)", range=[lo, max(g["yhat_hi_mw"].max(), thr[1]) * 1.03], row=1, col=1)
+    fig.update_yaxes(title_text="HDD (colder = higher)", rangemode="tozero", row=2, col=1)
     table = pd.DataFrame({"Day": labels, "Forecast peak (MW)": g["yhat_mw"].round(0).astype(int),
                           "Peak hour": g["t"].dt.strftime("%H:00"), "Coldest (°C)": tmin.round(1).values,
                           "HDD": hdd.round(1).values, "Alert": [f"{ALERT_MARK[l]} {l}" for l in g["level"]], "Action": [SHORT_ACTIONS[l] for l in g["level"]]})
@@ -244,7 +270,10 @@ def peak_risk(watch_pct: float, high_pct: float, temp_source: str):
 def history(start: str, end: str, grain: str, day_types: list[str], city: str):
     d = data()
     load = d["load"]
-    a, b = pd.Timestamp(start, tz=TZ), pd.Timestamp(end, tz=TZ) + pd.Timedelta(days=1)
+    d0, d1 = parse_day(start), parse_day(end)
+    if d0 is None or d1 is None:
+        return go.Figure(), go.Figure(), go.Figure(), BAD_DATE
+    a, b = d0.tz_localize(TZ), d1.tz_localize(TZ) + pd.Timedelta(days=1)
     s = load[(load.index >= a) & (load.index < b)]
     if not len(s):
         return go.Figure(), go.Figure(), go.Figure(), "No data in that range."
@@ -301,24 +330,30 @@ def history(start: str, end: str, grain: str, day_types: list[str], city: str):
 def correction(phase: str, start: str, end: str, version_labels: list[str], metric: str,
                watch_pct: float, high_pct: float):
     d = data()
+    empty = (go.Figure(), go.Figure(), go.Figure(), "No scored forecasts in that range.", pd.DataFrame(), pd.DataFrame(), go.Figure())
+    start, end = parse_day(start), parse_day(end)
+    if start is None or end is None:
+        return (*empty[:3], BAD_DATE, *empty[4:])
     s = d["scores"]
     s = s[s["actual_mw"].notna()]
     if phase != "Both":
         s = s[s["phase"] == ("backtest" if phase == "Replay" else "live")]
-    s = s[(s["day"] >= pd.Timestamp(start)) & (s["day"] <= pd.Timestamp(end))]
+    s = s[(s["day"] >= start) & (s["day"] <= end)]
     versions = [LABEL_VERSION[v] for v in version_labels] or ["retrained"]
     s = s[s["model_name"].isin(versions + ["baseline"])]
-    empty = (go.Figure(), go.Figure(), go.Figure(), "No scored forecasts in that range.", pd.DataFrame(), pd.DataFrame(), go.Figure())
     if not len(s):
         return empty
 
     # 1. predicted vs actual
     f1 = go.Figure()
     act = s.drop_duplicates("t").sort_values("t")
-    f1.add_trace(go.Scatter(x=act["t"], y=act["actual_mw"], name="Actual", line=dict(color=COLOR["actual"], width=1.5)))
+    hours = pd.date_range(act["t"].min(), act["t"].max(), freq="h")     # every hour, so days with no
+    f1.add_trace(go.Scatter(x=hours, y=act.set_index("t")["actual_mw"].reindex(hours),   # forecast show as a gap
+                            name="Actual", line=dict(color=COLOR["actual"], width=1.5), connectgaps=False))
     for v in versions:
-        x = s[s["model_name"] == v].sort_values("t")
-        f1.add_trace(go.Scatter(x=x["t"], y=x["yhat_mw"], name=VERSION_LABEL[v], line=dict(color=COLOR[v], width=1.2)))
+        x = s[s["model_name"] == v].set_index("t")["yhat_mw"]
+        f1.add_trace(go.Scatter(x=hours, y=x[~x.index.duplicated()].reindex(hours), name=VERSION_LABEL[v],
+                                line=dict(color=COLOR[v], width=1.2), connectgaps=False))
     f1.update_layout(**{**LAYOUT, "height": 520, "legend": dict(orientation="h", y=-0.36),
                         "margin": dict(l=60, r=30, t=50, b=40)},
                      title="Predicted vs actual hourly load (drag the slider below the chart to move)", yaxis_title="MW")
@@ -343,7 +378,7 @@ def correction(phase: str, start: str, end: str, version_labels: list[str], metr
     runs = d["runs"]
     rt = runs[(runs["model_name"] == "retrained") & (runs["accepted"] == 1)].copy()
     rt["day"] = pd.to_datetime(pd.to_datetime(rt["issued_at"], utc=True).dt.tz_convert(TZ).dt.date)
-    rt = rt[(rt["day"] >= pd.Timestamp(start)) & (rt["day"] <= pd.Timestamp(end))]
+    rt = rt[(rt["day"] >= start) & (rt["day"] <= end)]
     if len(rt):
         f2.add_trace(go.Scatter(x=rt["day"], y=[0] * len(rt), mode="markers", name="Accepted retrain",
                                 marker=dict(symbol="triangle-up", size=9, color=COLOR["retrained"]),
@@ -382,10 +417,12 @@ def correction(phase: str, start: str, end: str, version_labels: list[str], metr
     summary = pd.DataFrame(summ)
     best = summary.iloc[0]
     worst = summary[summary["Version"] == VERSION_LABEL["frozen"]]
-    note = f"**{best['Version']}**: {best['MAPE (%)']:.2f}% MAPE over {best['Days']} days"
+    note = f"### {best['Version']}: {best['MAPE (%)']:.2f}% average hourly error over {best['Days']} days"
     if len(worst) and best["Version"] != worst.iloc[0]["Version"]:
-        note += f", against {worst.iloc[0]['MAPE (%)']:.2f}% for the frozen model"
-    note += f"; skill vs baseline {best['Skill vs baseline']:+.0%}."
+        fz = worst.iloc[0]["MAPE (%)"]
+        note += (f"\nThe same model with no correction: **{fz:.2f}%**. Correcting itself cut the error by "
+                 f"**{(1 - best['MAPE (%)'] / fz):.0%}**.")
+    note += f" Against 'same hour last week': {best['Skill vs baseline']:+.0%} skill. (MAPE = mean absolute % error.)"
 
     # alert classification
     thr = thresholds(watch_pct, high_pct)
@@ -434,3 +471,75 @@ def validation_table() -> pd.DataFrame:
     t = t.rename(columns={"mape": "MAPE (%)", "mae": "MAE (MW)", "rmse": "RMSE (MW)", "peak_mape": "Peak error (%)",
                           "peak_hour_off": "Peak hour off (h)", "coverage": "Raw band coverage (%)"})
     return t.round(2)
+
+
+# ---------------------------------------------------------------- live days and downloads
+def live_days_table() -> pd.DataFrame:
+    """One row per day forecast by the daily job: what it said, what happened, how far off."""
+    d = data()
+    s = d["scores"]
+    s = s[s["phase"] == "live"]
+    cols = ["Day", "Issued (Pacific)", "Forecast peak (MW)", "Actual peak (MW)", "Peak error (%)",
+            "Hourly error, corrected (%)", "Hourly error, frozen (%)", "Status"]
+    if not len(s):
+        return pd.DataFrame(columns=cols)
+    main, frozen = s[s["model_name"] == "retrained"], s[s["model_name"] == "frozen"]
+    fz = frozen.groupby("day")["ape"].mean()
+    rows = []
+    for day, x in main.groupby("day"):
+        scored = x["actual_mw"].notna().sum() >= 23
+        issued = pd.to_datetime(x["issued_at"].iloc[0], utc=True).tz_convert(TZ)
+        fp, ap = x["yhat_mw"].max(), x["actual_mw"].max()
+        rows.append({"Day": f"{day:%a %Y-%m-%d}", "Issued (Pacific)": f"{issued:%a %d %b %H:%M}",
+                     "Forecast peak (MW)": round(fp), "Actual peak (MW)": round(ap) if scored else None,
+                     "Peak error (%)": round(abs(ap - fp) / ap * 100, 1) if scored else None,
+                     "Hourly error, corrected (%)": round(x["ape"].mean(), 1) if scored else None,
+                     "Hourly error, frozen (%)": round(fz.get(day, np.nan), 1) if scored else None,
+                     "Status": "scored" if scored else "waiting for BC Hydro actuals"})
+    return pd.DataFrame(rows, columns=cols).sort_values("Day", ascending=False, key=lambda c: c.str[4:])
+
+
+def _xlsx(name: str, sheets: dict[str, pd.DataFrame]) -> str:
+    """Write the tables to one Excel file (one sheet each) and return its path."""
+    path = Path(tempfile.gettempdir()) / name
+    with pd.ExcelWriter(path, engine="openpyxl") as xl:
+        for sheet, df in sheets.items():
+            (df if len(df.columns) else pd.DataFrame({"note": ["no data"]})).to_excel(xl, sheet_name=sheet[:31], index=False)
+    return str(path)
+
+
+def export_forecast(day_label: str, version_label: str, watch_pct: float, high_pct: float) -> str | None:
+    """Excel file for the Tomorrow and Peak-risk tabs: the hourly forecast and the 7-day outlook."""
+    if not day_label:
+        return None
+    day = pd.Timestamp(day_label.split(" ")[0])
+    run = _run_for(LABEL_VERSION[version_label], day)
+    hourly = pd.DataFrame({
+        "Hour (Pacific)": run["t"].dt.strftime("%Y-%m-%d %H:%M"), "Forecast (MW)": run["yhat_mw"].round(0),
+        "Low, 10% (MW)": run["yhat_lo_mw"].round(0), "High, 90% (MW)": run["yhat_hi_mw"].round(0),
+        "Actual (MW)": run["actual_mw"], "Error (%)": run["ape"].round(2), "Model version": version_label})
+    outlook = peak_risk(watch_pct, high_pct, "Provincial (population-weighted)")[1]
+    return _xlsx(f"bchydro_forecast_{day:%Y-%m-%d}.xlsx", {"Hourly forecast": hourly, "7-day outlook": outlook})
+
+
+def export_correction(phase: str, start: str, end: str, version_labels: list[str], metric: str,
+                      watch_pct: float, high_pct: float) -> str | None:
+    """Excel file for the Prediction-correction tab: accuracy, daily errors, live days, model log."""
+    out = correction(phase, start, end, version_labels, metric, watch_pct, high_pct)
+    summary, alerts = out[4], out[5]
+    a, b = parse_day(start), parse_day(end)
+    if a is None or b is None or not len(summary):
+        return None
+    s = data()["scores"]
+    s = s[s["actual_mw"].notna() & (s["day"] >= a) & (s["day"] <= b)]
+    if phase != "Both":
+        s = s[s["phase"] == ("backtest" if phase == "Replay" else "live")]
+    daily = (s.assign(Version=s["model_name"].map(VERSION_LABEL), Day=s["day"].dt.strftime("%Y-%m-%d"),
+                      Phase=s["phase"].map({"backtest": "replay", "live": "live"}))
+               .groupby(["Day", "Phase", "Version"], as_index=False)
+               .agg(**{"Forecast peak (MW)": ("yhat_mw", "max"), "Actual peak (MW)": ("actual_mw", "max"),
+                       "Hourly error, MAPE (%)": ("ape", "mean"), "MAE (MW)": ("err", lambda e: e.abs().mean())})
+               .round(2))
+    return _xlsx(f"bchydro_correction_{a:%Y%m%d}_{b:%Y%m%d}.xlsx",
+                 {"Accuracy": summary, "Daily errors": daily, "Live days": live_days_table(),
+                  "Alert accuracy": alerts, "Model log": model_log()})

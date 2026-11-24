@@ -2,8 +2,9 @@ name: daily
 
 on:
   schedule:
-    - cron: "30 16 * * *"   # 09:30 Pacific (BC is UTC-7 all year since 2026)
-    - cron: "30 20 * * *"   # 13:30 Pacific retry
+    # Odd minutes on purpose: GitHub delays jobs scheduled on the hour and half hour by hours.
+    - cron: "17 16 * * *"   # 09:17 Pacific (BC is UTC-7 all year since 2026)
+    - cron: "47 19 * * *"   # 12:47 Pacific retry
   workflow_dispatch:
 
 permissions:

@@ -39,7 +39,7 @@ pip install -r requirements.txt
 
 ## Get the database
 
-The database is one SQLite file, `data/bchydro.sqlite` (about 65 MB). It is not stored in
+The database is one SQLite file, `data/bchydro.sqlite` (about 85 MB, with the trained models and every forecast). It is not stored in
 git. Use either option:
 
 **A. Download it (seconds).** Save this file into the `data` folder:
@@ -117,7 +117,8 @@ them for display.
 
 ## Daily automation
 
-`.github/workflows/daily.yml` runs at 09:30 and 13:30 Pacific. Each run:
+`.github/workflows/daily.yml` runs twice each morning, at about 09:15 and 12:45 Pacific (GitHub can start
+scheduled jobs late). Each run:
 
 1. downloads the database from the `data` release of this repository,
 2. runs `python -m bchydro.jobs.daily`,
@@ -168,7 +169,11 @@ day: yesterday on weekdays, Thursday on weekends, with Monday's update covering 
 temperature slider), **Peak risk (7 days)**, **Explore history**, **Prediction correction** (accuracy by
 version, rolling error with retrain markers, error heatmap, alert precision/recall/F1, model log) and
 **About**. The Watch and High sliders at the top set the alert thresholds as percentiles of past winter
-daily peaks.
+daily peaks. Two buttons download what is on screen as Excel files: the hourly forecast with the 7-day
+outlook, and the correction results (accuracy, daily errors, live days, alert accuracy, model log).
+
+The job runs more than once a day, so the dashboard and the correction logic keep one forecast per version
+and day: the latest one issued, and a live forecast over a replayed one.
 
 ### Hosting on Hugging Face Spaces
 

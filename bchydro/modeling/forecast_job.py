@@ -200,13 +200,14 @@ class Engine:
     def load_history_from_db(self) -> None:
         """Live runs: rebuild the history and each version's state from the database."""
         h = pd.read_sql("""
-            SELECT r.model_name, r.issued_at, r.train_end, r.params_json, f.target_ts_utc, f.yhat_mw, f.yhat_lo_mw,
+            SELECT r.run_id, r.phase, r.model_name, r.issued_at, r.train_end, r.params_json, f.target_ts_utc, f.yhat_mw, f.yhat_lo_mw,
                    f.yhat_hi_mw, COALESCE(f.bias_mw, 0) AS bias_mw, l.load_mw
             FROM forecasts f JOIN model_runs r ON r.run_id = f.run_id
             LEFT JOIN load_hourly l ON l.ts_utc = f.target_ts_utc
             WHERE r.model_name IN ('baseline','frozen','bias_corrected','retrained')""", self.con)
         if not len(h):
             return
+        h = one_run_per_day(h)
         t = pd.to_datetime(h["target_ts_utc"], utc=True)
         loc = t.dt.tz_convert(config.LOCAL_TZ)
         issued = pd.to_datetime(h["issued_at"], utc=True).dt.tz_convert(config.LOCAL_TZ)
@@ -226,6 +227,16 @@ class Engine:
                 if p.get("last_retrain_day"):
                     st.last_retrain_day = pd.Timestamp(p["last_retrain_day"])
                 st.last_band_day = pd.Timestamp(p["last_band_day"]) if p.get("last_band_day") else None
+
+
+def one_run_per_day(h: pd.DataFrame) -> pd.DataFrame:
+    """Keep one forecast per version and target day. The job runs more than once a day and
+    the replay can overlap live days: a live run wins over the replay, then the latest run."""
+    day = pd.to_datetime(h["target_ts_utc"], utc=True).dt.tz_convert(config.LOCAL_TZ).dt.date
+    k = pd.DataFrame({"model_name": h["model_name"], "day": day, "run_id": h["run_id"],
+                      "live": (h["phase"] == "live").astype(int)}).drop_duplicates()
+    keep = k.sort_values(["live", "run_id"]).groupby(["model_name", "day"])["run_id"].last()
+    return h[h["run_id"].isin(set(keep))]
 
 
 def write_run(con, phase: str, name: str, r: dict) -> int:
@@ -315,6 +326,8 @@ def outlook(con, eng: Engine, day: pd.Timestamp, avail: pd.Timestamp, issued: pd
     loc_day = X.index.tz_convert(config.LOCAL_TZ).date
     full = pd.Series(loc_day).value_counts()
     X = X[pd.Series(loc_day, index=X.index).map(full).to_numpy() >= 23]      # whole days only
+    if X.empty:              # no weather forecast for the coming days: keep the last outlook
+        return
     p = m.predict(X)
     s = eng.band_scale0
     f = pd.DataFrame({"yhat": p["yhat"], "lo": p["yhat"] - (p["yhat"] - p["lo"]) * s,

@@ -31,7 +31,7 @@ def _last_actual_day() -> str:
 with gr.Blocks(title="BC Hydro demand forecast") as demo:
     gr.Markdown("# BC Hydro demand forecast\n"
                 "Day-ahead hourly load for the BC Hydro grid, for grid operations and load-forecasting analysts. "
-                "Forecasts are issued daily at 09:30 Pacific and correct themselves as BC Hydro publishes actuals.")
+                "Forecasts are issued every day for the next day and correct themselves as BC Hydro publishes actuals.")
     status = gr.Markdown(elem_id="status")
 
     with gr.Row():
@@ -48,6 +48,7 @@ with gr.Blocks(title="BC Hydro demand forecast") as demo:
         actions = gr.Markdown()
         gr.Markdown("Shaded green hours are the six lowest-demand hours: candidates for exports. "
                     "The what-if line reruns the model with every temperature shifted, keeping the corrections.")
+        dl_forecast = gr.DownloadButton("Download this forecast and the 7-day outlook (Excel)", size="sm")
 
     with gr.Tab("Peak risk (7 days)"):
         temp_src = gr.Dropdown(CITIES, value=CITIES[0], label="Temperature shown")
@@ -84,7 +85,11 @@ with gr.Blocks(title="BC Hydro demand forecast") as demo:
             c_versions = gr.CheckboxGroup(VERSIONS[:3], value=VERSIONS[:3], label="Versions (first = heatmap and alerts)")
             metric = gr.Dropdown(["MAPE (%)", "MAE (MW)", "Peak error (%)"], value="MAPE (%)", label="Metric")
         c_note = gr.Markdown()
+        gr.Markdown("### Live forecasts so far\nEach row is a forecast the daily job issued before the day happened, "
+                    "scored once BC Hydro published the actual load.")
+        live_tbl = gr.Dataframe(interactive=False, wrap=True)
         summary = gr.Dataframe(interactive=False, label="Accuracy over the selected period")
+        dl_correction = gr.DownloadButton("Download these results (Excel)", size="sm")
         plot_c2 = gr.Plot(show_label=False)
         plot_c1 = gr.Plot(show_label=False)
         plot_c3 = gr.Plot(show_label=False)
@@ -98,7 +103,7 @@ with gr.Blocks(title="BC Hydro demand forecast") as demo:
 
     with gr.Tab("About"):
         val = gr.Dataframe(interactive=False, label="Model selection on 2024 (trained 2015-2023)")
-        gr.Markdown(f"""
+        gr.Markdown("""
 **Audience.** BC Hydro grid operations and load-forecasting analysts, who decide a day ahead how dams,
 imports and exports will cover demand. More than 90% of BC Hydro's generation is hydro; reservoir water is
 limited in dry years, so forecasting demand well saves water and avoids short-notice imports.
@@ -116,7 +121,8 @@ daily peak misses by more than 5%, errors lean one way for 5 days by more than 2
 1.25 × the validation MAPE twice; band widened or narrowed when 14-day coverage leaves 70-90%.
 
 **Limits.** Experimental forecasts, not BC Hydro's. The archived weather forecasts are short-range, so replay
-scores are slightly better than a true day-ahead run would be. Record peak used for alerts: {config.RECORD_PEAK_MW:,} MW.
+scores are slightly better than a true day-ahead run would be. A day is also High when its peak is within 3%
+of the highest hour on record in this data.
 """)
 
     # ------------------------------------------------------------ wiring
@@ -125,27 +131,35 @@ scores are slightly better than a true day-ahead run would be. Record peak used 
         days = D.forecast_days()
         last = _last_actual_day()
         return (D.status_line(), gr.update(choices=days, value=days[0] if days else None), last, last,
-                D.model_log(), D.validation_table())
+                D.model_log(), D.validation_table(), D.live_days_table())
 
     t_inputs = [day, version, shift, watch_pct, high_pct]
     r_inputs = [watch_pct, high_pct, temp_src]
     h_inputs = [h_start, h_end, grain, day_types, city]
     c_inputs = [phase, c_start, c_end, c_versions, metric, watch_pct, high_pct]
-    t_out, r_out = [kpi, plot_t, actions], [plot_r, risk_table, risk_msg]
+    t_out, r_out = [kpi, plot_t, actions, dl_forecast], [plot_r, risk_table, risk_msg]
     h_out = [plot_h1, plot_h2, plot_h3, h_note]
-    c_out = [plot_c1, plot_c2, plot_c3, c_note, summary, cls_table, plot_cm]
+    c_out = [plot_c1, plot_c2, plot_c3, c_note, summary, cls_table, plot_cm, dl_correction]
+
+    def tomorrow_view(day_label, version_label, shift, watch, high):
+        """The Tomorrow tab plus the Excel file behind its download button."""
+        return (*D.tomorrow(day_label, version_label, shift, watch, high),
+                D.export_forecast(day_label, version_label, watch, high))
+
+    def correction_view(*args):
+        return (*D.correction(*args), D.export_correction(*args))
 
     def all_views(*args):
-        t = D.tomorrow(*args[:5])
+        t = tomorrow_view(*args[:5])
         r = D.peak_risk(*args[5:8])
         h = D.history(*args[8:13])
-        c = D.correction(*args[13:20])
+        c = correction_view(*args[13:20])
         return (*t, *r, *h, *c)
 
-    demo.load(on_load, outputs=[status, day, h_end, c_end, log, val]).then(
+    demo.load(on_load, outputs=[status, day, h_end, c_end, log, val, live_tbl]).then(
         all_views, inputs=t_inputs + r_inputs + h_inputs + c_inputs, outputs=t_out + r_out + h_out + c_out)
     for comp in t_inputs:
-        comp.change(D.tomorrow, t_inputs, t_out)
+        comp.change(tomorrow_view, t_inputs, t_out)
     for comp in r_inputs:
         comp.change(D.peak_risk, r_inputs, r_out)
     for comp in [h_start, h_end]:
@@ -153,11 +167,14 @@ scores are slightly better than a true day-ahead run would be. Record peak used 
     for comp in [grain, day_types, city]:
         comp.change(D.history, h_inputs, h_out)
     for comp in [c_start, c_end]:
-        comp.submit(D.correction, c_inputs, c_out)
+        comp.submit(correction_view, c_inputs, c_out)
     for comp in [phase, c_versions, metric, watch_pct, high_pct]:
-        comp.change(D.correction, c_inputs, c_out)
+        comp.change(correction_view, c_inputs, c_out)
 
 
 if __name__ == "__main__":
-    demo.launch(server_name=os.getenv("HOST", "127.0.0.1"), server_port=int(os.getenv("PORT", "7860")),
+    # No fixed address: Gradio listens on 127.0.0.1 locally and on the address Hugging Face
+    # Spaces sets (GRADIO_SERVER_NAME / GRADIO_SERVER_PORT). HOST and PORT still override.
+    demo.launch(server_name=os.getenv("HOST") or None,
+                server_port=int(os.environ["PORT"]) if os.getenv("PORT") else None,
                 theme=gr.themes.Soft(primary_hue="blue"), css=CSS)
